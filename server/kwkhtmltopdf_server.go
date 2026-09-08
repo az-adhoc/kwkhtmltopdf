@@ -12,11 +12,15 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 )
 
 // a render that outlives this has no reader left: the caller is long gone
 const defaultRenderTimeout = 120 * time.Second
+
+// one day, an absurd timeout that still fits in a time.Duration
+const maxRenderTimeoutSeconds = 24 * 60 * 60
 
 // TODO ignore opts?
 // --log-level, -q, --quiet, --read-args-from-stdin, --dump-default-toc-xsl
@@ -42,7 +46,8 @@ func renderTimeout() time.Duration {
 		return defaultRenderTimeout
 	}
 	seconds, err := strconv.Atoi(value)
-	if err != nil || seconds < 0 {
+	// the upper bound keeps the multiplication below from overflowing
+	if err != nil || seconds < 0 || seconds > maxRenderTimeoutSeconds {
 		log.Printf("ignoring invalid KWKHTMLTOPDF_TIMEOUT %q, using %s", value, defaultRenderTimeout)
 		return defaultRenderTimeout
 	}
@@ -213,18 +218,28 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// kill the render when the caller is gone or the timeout is over
-	rendered := make(chan struct{})
-	defer close(rendered)
+	stopWatchdog := make(chan struct{})
+	watchdogDone := make(chan struct{})
+	var stopOnce sync.Once
+	// no kill may happen once we reap: the pid could already be reused
+	stopWatching := func() {
+		stopOnce.Do(func() { close(stopWatchdog) })
+		<-watchdogDone
+	}
 	go func() {
+		defer close(watchdogDone)
 		select {
 		case <-ctx.Done():
 			killProcessTree(cmd)
-		case <-rendered:
+			// a descendant may still hold the pipe: unblock the copy
+			cmdStdout.Close()
+		case <-stopWatchdog:
 		}
 	}()
-	// reap the child on the error paths too, or it is left as a zombie
+	// reap the child on the error paths too, or it is left behind
 	reaped := false
 	defer func() {
+		stopWatching()
 		if reaped {
 			return
 		}
@@ -234,14 +249,18 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, err = io.Copy(w, cmdStdout)
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			err = errors.New("render timed out after " + timeout.String())
+		}
 		httpAbort(w, err)
 		return
 	}
+	stopWatching()
 	err = cmd.Wait()
 	reaped = true
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			err = errors.New("render timed out after " + timeout.String() + ": " + err.Error())
+			err = errors.New("render timed out after " + timeout.String())
 		}
 		httpAbort(w, err)
 		return
